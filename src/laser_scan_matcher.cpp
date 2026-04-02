@@ -82,6 +82,11 @@ LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(
     "When to generate keyframe scan.");
   add_parameter("kf_dist_angular", rclcpp::ParameterValue(10.0* (M_PI/180.0)),
     "When to generate keyframe scan.");
+  add_parameter("kf_update_policy", rclcpp::ParameterValue(std::string("fixed")),
+    "Keyframe update policy: 'distance' (update when displacement exceeds threshold) "
+    "or 'fixed' (never update keyframe).");
+  add_parameter("n_reference_scans", rclcpp::ParameterValue(1),
+    "Number of scans to average for the reference scan (1 = no averaging).");
   
 
 
@@ -169,7 +174,7 @@ LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(
   add_parameter("outliers_remove_doubles", rclcpp::ParameterValue(1),
     "No two points in laser_sens can have the same corr.");
   
-  add_parameter("do_compute_covariance", rclcpp::ParameterValue(0),
+  add_parameter("do_compute_covariance", rclcpp::ParameterValue(1),
     "If 1, computes the covariance of ICP using the method http://purl.org/censi/2006/icpcov");
   
   add_parameter("debug_verify_tricks", rclcpp::ParameterValue(0),
@@ -188,8 +193,10 @@ LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(
   base_frame_ = this->get_parameter("base_frame").as_string();
   odom_frame_ = this->get_parameter("odom_frame").as_string();
   laser_frame_ = this->get_parameter("laser_frame").as_string();
-  kf_dist_linear_  = this->get_parameter("kf_dist_linear").as_double();
-  kf_dist_angular_ = this->get_parameter("kf_dist_angular").as_double();
+  kf_dist_linear_    = this->get_parameter("kf_dist_linear").as_double();
+  kf_dist_angular_   = this->get_parameter("kf_dist_angular").as_double();
+  kf_update_policy_  = this->get_parameter("kf_update_policy").as_string();
+  n_reference_scans_ = this->get_parameter("n_reference_scans").as_int();
   odom_topic_   = this->get_parameter("publish_odom").as_string();
   publish_tf_   = this->get_parameter("publish_tf").as_bool(); 
 
@@ -282,18 +289,31 @@ void LaserScanMatcher::scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr
 
   if (!initialized_)
   {
-    createCache(scan_msg);    // caches the sin and cos of all angles
-
-    // cache the static tf from base to laser
-    if (!getBaseToLaserTf(laser_frame_))
+    if (ref_scan_buffer_.empty())
     {
-      RCLCPP_WARN(get_logger(),"Skipping scan");
+      createCache(scan_msg);
+      if (!getBaseToLaserTf(laser_frame_))
+      {
+        RCLCPP_WARN(get_logger(), "Skipping scan");
+        return;
+      }
+    }
+
+    ref_scan_buffer_.push_back(scan_msg);
+    if (static_cast<int>(ref_scan_buffer_.size()) < n_reference_scans_)
+    {
+      RCLCPP_INFO(get_logger(), "Collecting reference scans: %zu / %d",
+                  ref_scan_buffer_.size(), n_reference_scans_);
       return;
     }
 
-    laserScanToLDP(scan_msg, prev_ldp_scan_);
+    auto ref_scan = averageScans(ref_scan_buffer_);
+    ref_scan_buffer_.clear();
+
+    laserScanToLDP(ref_scan, prev_ldp_scan_);
     last_icp_time_ = scan_msg->header.stamp;
     initialized_ = true;
+    RCLCPP_INFO(get_logger(), "Reference scan set (averaged %d scans)", n_reference_scans_);
   }
 
   LDP curr_ldp_scan;
@@ -429,15 +449,28 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     return false;
   }
 
+  // ICP covariance of the current scan relative to the keyframe
+  Eigen::Matrix3d cov_rel = Eigen::Matrix3d::Zero();
+  if (input_.do_compute_covariance && output_.cov_x_m)
+  {
+    for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j)
+        cov_rel(i, j) = gsl_matrix_get(output_.cov_x_m, i, j);
+  }
+  else
+  {
+    cov_rel(0, 0) = 0.01;
+    cov_rel(1, 1) = 0.01;
+    cov_rel(2, 2) = 0.01;
+  }
 
   if (publish_odom_)
   {
-    // stamped Pose message
     nav_msgs::msg::Odometry odom_msg;
 
     odom_msg.header.stamp    = time;
     odom_msg.header.frame_id = odom_frame_;
-    odom_msg.child_frame_id = base_frame_;
+    odom_msg.child_frame_id  = base_frame_;
     odom_msg.pose.pose.position.x = f2b_.getOrigin().x();
     odom_msg.pose.pose.position.y = f2b_.getOrigin().y();
     odom_msg.pose.pose.position.z = f2b_.getOrigin().z();
@@ -447,18 +480,29 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     odom_msg.pose.pose.orientation.z = f2b_.getRotation().z();
     odom_msg.pose.pose.orientation.w = f2b_.getRotation().w();
 
-    // Get pose difference in base frame and calculate velocities
+    for (int i = 0; i < 36; i++) odom_msg.pose.covariance[i] = 0.0;
+
+    // ICP covariance [x, y, yaw]
+    odom_msg.pose.covariance[0]  = cov_rel(0, 0); // Var(X)
+    odom_msg.pose.covariance[7]  = cov_rel(1, 1); // Var(Y)
+    odom_msg.pose.covariance[35] = cov_rel(2, 2); // Var(Yaw)
+    odom_msg.pose.covariance[1]  = cov_rel(0, 1); // Cov(X, Y)
+    odom_msg.pose.covariance[6]  = cov_rel(1, 0);
+    odom_msg.pose.covariance[5]  = cov_rel(0, 2); // Cov(X, Yaw)
+    odom_msg.pose.covariance[30] = cov_rel(2, 0);
+    odom_msg.pose.covariance[11] = cov_rel(1, 2); // Cov(Y, Yaw)
+    odom_msg.pose.covariance[31] = cov_rel(2, 1);
+
     auto pose_difference = prev_f2b_.inverse() * f2b_;
-    odom_msg.twist.twist.linear.x = pose_difference.getOrigin().getX()/dt;
-    odom_msg.twist.twist.linear.y = pose_difference.getOrigin().getY()/dt;
-    odom_msg.twist.twist.angular.z = tf2::getYaw(pose_difference.getRotation())/dt;
+    odom_msg.twist.twist.linear.x  = pose_difference.getOrigin().getX() / dt;
+    odom_msg.twist.twist.linear.y  = pose_difference.getOrigin().getY() / dt;
+    odom_msg.twist.twist.angular.z = tf2::getYaw(pose_difference.getRotation()) / dt;
 
     prev_f2b_ = f2b_;
 
     odom_publisher_->publish(odom_msg);
   }
 
-  
   if (publish_tf_)
   {
     geometry_msgs::msg::TransformStamped tf_msg;
@@ -469,28 +513,35 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     tf_msg.transform.rotation.y = f2b_.getRotation().y();
     tf_msg.transform.rotation.z = f2b_.getRotation().z();
     tf_msg.transform.rotation.w = f2b_.getRotation().w();
-  
+
     tf_msg.header.stamp = time;
     tf_msg.header.frame_id = odom_frame_;
     tf_msg.child_frame_id = base_frame_;
-    //tf2::Stamped<tf2::Transform> transform_msg (f2b_, time, map_frame_, base_frame_);
-    tfB_->sendTransform (tf_msg);
+    tfB_->sendTransform(tf_msg);
   }
 
-  // **** swap old and new
-  if (newKeyframeNeeded(corr_ch))
+  // **** keyframe update policy
+  bool update_kf = false;
+  if (kf_update_policy_ == "distance")
+    update_kf = newKeyframeNeeded(corr_ch);
+  else if (kf_update_policy_ == "fixed")
+    update_kf = false;
+  else
+    RCLCPP_WARN_ONCE(get_logger(),
+      "Unknown keyframe policy '%s', falling back to 'distance'",
+      kf_update_policy_.c_str());
+
+  if (update_kf)
   {
-    // generate a keyframe
     ld_free(prev_ldp_scan_);
     prev_ldp_scan_ = curr_ldp_scan;
     f2b_kf_ = f2b_;
-
   }
   else
   {
     ld_free(curr_ldp_scan);
-
   }
+
   last_icp_time_ = now();
   return true;
 }
@@ -506,6 +557,32 @@ bool LaserScanMatcher::newKeyframeNeeded(const tf2::Transform& d)
     return true;
 
   return false;
+}
+
+sensor_msgs::msg::LaserScan::SharedPtr LaserScanMatcher::averageScans(
+  const std::vector<sensor_msgs::msg::LaserScan::SharedPtr>& scans)
+{
+  auto avg = std::make_shared<sensor_msgs::msg::LaserScan>(*scans.back());
+  size_t n = avg->ranges.size();
+
+  std::vector<double> sum(n, 0.0);
+  std::vector<int> cnt(n, 0);
+
+  for (const auto& s : scans) {
+    for (size_t i = 0; i < n; i++) {
+      float r = s->ranges[i];
+      if (r > s->range_min && r < s->range_max) {
+        sum[i] += r;
+        cnt[i]++;
+      }
+    }
+  }
+
+  for (size_t i = 0; i < n; i++) {
+    avg->ranges[i] = (cnt[i] > 0) ? static_cast<float>(sum[i] / cnt[i]) : 0.0f;
+  }
+
+  return avg;
 }
 
 void LaserScanMatcher::laserScanToLDP(const sensor_msgs::msg::LaserScan::SharedPtr& scan, LDP& ldp)

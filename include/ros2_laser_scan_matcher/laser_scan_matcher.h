@@ -44,12 +44,13 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/message_filter.h>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2/utils.h>
 
 #include "rclcpp/rclcpp.hpp"
 
 #include <csm/csm.h>  // csm defines min and max, but Eigen complains
+#include <Eigen/Dense>
 #include <boost/thread.hpp>
 
 
@@ -85,10 +86,17 @@ private:
   double kf_dist_linear_;
   double kf_dist_linear_sq_;
   double kf_dist_angular_;
+  std::string kf_update_policy_; // "distance" | "fixed"
 
   bool initialized_;
   bool publish_odom_;
   bool publish_tf_;
+
+  // Reference scan averaging
+  int n_reference_scans_;
+  std::vector<sensor_msgs::msg::LaserScan::SharedPtr> ref_scan_buffer_;
+  sensor_msgs::msg::LaserScan::SharedPtr averageScans(
+    const std::vector<sensor_msgs::msg::LaserScan::SharedPtr>& scans);
 
   tf2::Transform f2b_;     // fixed-to-base tf (pose of base frame in fixed frame)
   tf2::Transform prev_f2b_; // previous fixed-to-base tf (for odometry calculation)
